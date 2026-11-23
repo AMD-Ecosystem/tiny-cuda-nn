@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -31,7 +32,9 @@
 
 #include <tiny-cuda-nn/common_host.h>
 
+#if !defined(TCNN_USE_HIP)
 #include <cuda.h>
+#endif
 
 #include <deque>
 #include <functional>
@@ -91,6 +94,11 @@ public:
 			m_graph = nullptr;
 		}
 
+#if defined(TCNN_USE_HIP)
+		// Library handles must exist before capturing (their creation is not capturable).
+		hipblas_initialize();
+#endif
+
 		CUDA_CHECK_THROW(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
 		current_captures().push_back(this);
 
@@ -124,7 +132,23 @@ public:
 			// This is cheaper than creating a new instance from scratch (and may involve just updating
 			// pointers rather than changing the topology of the graph.)
 			if (m_graph_instance) {
-#if CUDA_VERSION >= 12000
+#if defined(TCNN_USE_HIP)
+				// HIP reports a rejected update through the return value. The topology of the graph can change
+				// from one capture to the next, e.g. when a library handle became available between them.
+				cudaGraphExecUpdateResult update_result;
+				cudaGraphNode_t error_node;
+				const cudaError_t update_error = cudaGraphExecUpdate(m_graph_instance, m_graph, &error_node, &update_result);
+				if (update_error != cudaSuccess && update_error != hipErrorGraphExecUpdateFailure) {
+					CUDA_CHECK_THROW(update_error);
+				}
+
+				// If the update failed, reset graph instance. We will create a new one next.
+				if (update_error != cudaSuccess || update_result != cudaGraphExecUpdateSuccess) {
+					(void)cudaGetLastError(); // clear the error recorded by the rejected update
+					CUDA_CHECK_THROW(cudaGraphExecDestroy(m_graph_instance));
+					m_graph_instance = nullptr;
+				}
+#elif CUDA_VERSION >= 12000
 				cudaGraphExecUpdateResultInfo update_result;
 				CUDA_CHECK_THROW(cudaGraphExecUpdate(m_graph_instance, m_graph, &update_result));
 

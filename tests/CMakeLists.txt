@@ -1,4 +1,5 @@
 # Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
@@ -22,6 +23,9 @@
 
 function (create_test TEST_NAME)
 	add_executable(${TEST_NAME} ${TEST_NAME}.cu)
+	if (TCNN_USE_HIP)
+		set_source_files_properties(${TEST_NAME}.cu PROPERTIES LANGUAGE HIP)
+	endif()
 	target_link_libraries(${TEST_NAME} tiny-cuda-nn)
 	add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME} ${ARGN})
 endfunction()
@@ -30,6 +34,15 @@ create_test(test_encodings)
 create_test(test_grid)
 create_test(test_jit_losses)
 create_test(test_networks)
+create_test(test_fused_mlp_parity)
 if (NOT TCNN_BUILD_NO_FWD_BWD)
 	create_test(test_permuto --warn NoTests)
+endif()
+
+# ROCm-specific regression tests
+if (TCNN_USE_HIP)
+	if (NOT TCNN_BUILD_NO_FWD_BWD)
+		create_test(test_grid_gradients)
+	endif()
+	create_test(test_hipblaslt_streams)
 endif()

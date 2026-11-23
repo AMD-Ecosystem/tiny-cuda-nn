@@ -260,6 +260,34 @@ model.jit_fusion = tcnn.supports_jit_fusion() # Optional: accelerate with JIT fu
 See `samples/mlp_learning_an_image_pytorch.py` for an example.
 
 
+## AMD GPUs (ROCm)
+
+__tiny-cuda-nn__ can also be built for AMD GPUs with [ROCm](https://rocm.docs.amd.com) and HIP. The CUDA sources are compiled as HIP through a small compatibility header (`include/tiny-cuda-nn/cuda_to_hip.h`); the NVIDIA build is unaffected. The ROCm build has been developed on AMD Instinct MI300X (gfx942) with ROCm 10.0.0 and also targets the MI350 series (gfx950).
+
+Differences from the CUDA build:
+- `FullyFusedMLP` runs on the AMD matrix cores through [rocWMMA](https://github.com/ROCm/rocWMMA) (fp16 inputs, fp32 accumulation), for widths 16, 32, 64 and 128.
+- `CutlassMLP` and the fully fused MLP's output/weight-gradient GEMMs use [hipBLASLt](https://github.com/ROCm/hipBLASLt) (with [hipBLAS](https://github.com/ROCm/hipBLAS) as the fallback) instead of CUTLASS.
+- JIT fusion (runtime compilation) is not available; `tcnn.supports_jit_fusion()` returns `False` and the precompiled kernels are used.
+- The Shampoo optimizer (`TCNN_ALLOW_CUBLAS_CUSOLVER`) is not available.
+
+Requirements: ROCm 10.0.0 or newer with hipBLAS, hipBLASLt and rocWMMA, for instance from the ROCm Python packages (`pip install "rocm[libraries,devel]" --index-url https://stable.repo.amd.com/rocm/whl-next/`, then `rocm-sdk init`), and CMake 3.21 or newer.
+
+Build the library, samples and tests:
+```sh
+export ROCM_PATH=$(rocm-sdk path --root)   # or /opt/rocm for a system installation
+cmake . -B build -DTCNN_USE_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx942;gfx950" \
+	-DCMAKE_PREFIX_PATH=$ROCM_PATH -DCMAKE_HIP_COMPILER=$ROCM_PATH/lib/llvm/bin/clang++ \
+	-DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --config RelWithDebInfo -j
+```
+
+Build the PyTorch extension against a ROCm build of PyTorch (the ROCm branch is selected automatically when `torch.version.hip` is set):
+```sh
+export ROCM_PATH=$(rocm-sdk path --root) ROCM_HOME=$(rocm-sdk path --root)
+export PYTORCH_ROCM_ARCH="gfx942;gfx950"   # AMD GPU architectures to build for
+cd bindings/torch && pip install --no-build-isolation .
+```
+
 
 ## Components
 

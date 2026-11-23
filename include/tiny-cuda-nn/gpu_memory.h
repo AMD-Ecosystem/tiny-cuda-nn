@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -35,7 +36,9 @@
 #include <tiny-cuda-nn/common_host.h>
 #include <tiny-cuda-nn/cuda_graph.h>
 
+#if !defined(TCNN_USE_HIP)
 #include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -150,7 +153,7 @@ public:
 
 	/// Frees memory again
 	TCNN_HOST_DEVICE ~GPUMemory() {
-#ifndef __CUDA_ARCH__
+#if !defined(TCNN_DEVICE_CODE)
 		try {
 			if (m_data) {
 				free_memory();

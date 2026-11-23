@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -31,7 +32,11 @@
 
 #include <json/json.hpp>
 
+#if defined(TCNN_USE_HIP)
+#include <tiny-cuda-nn/cuda_to_hip.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <memory>
 #include <string>

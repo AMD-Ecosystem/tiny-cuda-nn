@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -38,6 +39,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <tiny-cuda-nn/cuda_to_hip.h>
+
 #if defined(__CUDACC__)
 #  include <cuda_fp16.h>
 #endif
@@ -50,7 +53,7 @@
 #define STR(x) STRINGIFY(x)
 #define FILE_LINE __FILE__ ":" STR(__LINE__)
 
-#if defined(__CUDA_ARCH__)
+#if defined(TCNN_DEVICE_CODE)
 	#define TCNN_PRAGMA_UNROLL _Pragma("unroll")
 	#define TCNN_PRAGMA_NO_UNROLL _Pragma("unroll 1")
 #else
@@ -66,7 +69,7 @@
 #  endif
 #endif
 
-#if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
+#if defined(TCNN_GPU_COMPILER) || (defined(__clang__) && defined(__CUDA__))
 #define TCNN_HOST_DEVICE __host__ __device__
 #define TCNN_DEVICE __device__
 #define TCNN_HOST __host__
@@ -118,7 +121,7 @@ static constexpr bool PARAMS_ALIGNED = true;
 // 53-60, 62 |                      no |                       70 |  __half (no tensor cores)
 //  <=52, 61 |                      no |                       70 |   float (no tensor cores)
 
-#if defined(__CUDACC__)
+#if defined(TCNN_GPU_COMPILER)
 #  if TCNN_HALF_PRECISION
 using network_precision_t = __half;
 #  else
@@ -239,7 +242,7 @@ inline constexpr TCNN_HOST_DEVICE uint32_t next_pot(uint32_t v) {
 
 template <typename T> constexpr TCNN_HOST_DEVICE float default_loss_scale();
 template <> constexpr TCNN_HOST_DEVICE float default_loss_scale<float>() { return 1.0f; }
-#ifdef __CUDACC__
+#if defined(TCNN_GPU_COMPILER)
 template <> constexpr TCNN_HOST_DEVICE float default_loss_scale<__half>() { return 128.0f; }
 #endif
 

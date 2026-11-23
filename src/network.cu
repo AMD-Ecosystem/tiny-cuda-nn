@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -35,7 +36,9 @@
 
 #if TCNN_MIN_GPU_ARCH > 70
 #include <tiny-cuda-nn/networks/fully_fused_mlp.h>
+#if !defined(TCNN_USE_HIP) // mma.h is NVIDIA-PTX device code for runtime compilation, which is not available on ROCm
 #include <tiny-cuda-nn/mma.h>
+#endif
 #endif
 
 

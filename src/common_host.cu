@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -32,7 +33,13 @@
 #include <tiny-cuda-nn/gpu_memory.h>
 #include <tiny-cuda-nn/multi_stream.h>
 
+#if defined(TCNN_USE_HIP)
+#include <tiny-cuda-nn/hip_matmul.h>
+#endif
+
+#if !defined(TCNN_USE_HIP)
 #include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -41,7 +48,9 @@
 
 namespace tcnn {
 
+#if !defined(TCNN_USE_HIP)
 static_assert(__CUDACC_VER_MAJOR__ > 10 || (__CUDACC_VER_MAJOR__ == 10 && __CUDACC_VER_MINOR__ >= 2), "tiny-cuda-nn requires at least CUDA 10.2");
+#endif
 
 std::function<void(LogSeverity, const std::string&)> g_log_callback = [](LogSeverity severity, const std::string& msg) {
 	switch (severity) {
@@ -210,6 +219,16 @@ int cuda_device() {
 	CUDA_CHECK_THROW(cudaGetDevice(&device));
 	return device;
 }
+
+#if defined(TCNN_USE_HIP)
+void hipblas_initialize() {
+	hipblasHandle_t& handle = hipblas_handle_slot();
+	if (!handle) {
+		HIPBLAS_CHECK_THROW(hipblasCreate(&handle));
+	}
+	hipblaslt_create_deferred_handles();
+}
+#endif
 
 void set_cuda_device(int device) { CUDA_CHECK_THROW(cudaSetDevice(device)); }
 

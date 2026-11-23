@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -40,6 +41,7 @@ TEMPLATE_TEST_CASE("Losses match with and without JIT", "[loss][jit]", network_p
 
 	if (!supports_jit_fusion()) {
 		SUCCEED("GPU target does not support JIT.");
+		return;
 	}
 
 	tcnn_test_setup();

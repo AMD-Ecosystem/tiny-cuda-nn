@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -30,7 +31,9 @@
 
 #include <tiny-cuda-nn/common_host.h>
 
+#if !defined(TCNN_USE_HIP)
 #include <cuda.h>
+#endif
 
 #ifdef TCNN_CMRC
 namespace cmrc { class embedded_filesystem; }
@@ -84,5 +87,13 @@ private:
 	CUmodule m_module = {};
 	CUfunction m_kernel = {};
 };
+
+#if !defined(TCNN_RTC)
+// Without runtime compilation support, kernels can never be constructed (see rtc_kernel.cu), so
+// `set` is unreachable; it still needs a definition because `launch` references it.
+inline void CudaRtcKernel::set(CUfunction_attribute, int) {
+	throw std::runtime_error{"tiny-cuda-nn was not compiled with runtime compilation (RTC) support."};
+}
+#endif
 
 }

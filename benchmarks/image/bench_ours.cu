@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -43,6 +44,8 @@
 #include <fmt/core.h>
 
 #include <stbi/stbi_wrapper.h>
+
+#include "../../samples/image_texture.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -91,7 +94,7 @@ void save_image(const T* image, int width, int height, int n_channels, int chann
 }
 
 template <uint32_t stride>
-__global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, bool filter, int width, int height, float* __restrict__ xs_and_ys, float* __restrict__ result) {
+__global__ void eval_image(uint32_t n_elements, ImageTexture texture, bool filter, int width, int height, float* __restrict__ xs_and_ys, float* __restrict__ result) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) return;
 
@@ -104,7 +107,7 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, boo
 		pos.y = (roundf(pos.y * height - 0.5f) + 0.5f) / height;
 	}
 
-	float4 val = tex2D<float4>(texture, pos.x, pos.y);
+	float4 val = sample_image_texture(texture, pos.x, pos.y);
 	result[output_idx + 0] = val.x;
 	result[output_idx + 1] = val.y;
 	result[output_idx + 2] = val.z;
@@ -134,6 +137,9 @@ int main(int argc, char* argv[]) {
 		GPUMemory<float> image = load_image(argv[1], width, height);
 
 		// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
+#if defined(TCNN_USE_HIP)
+		ImageTexture texture = create_image_texture(image.data(), width, height);
+#else
 		cudaResourceDesc resDesc;
 		memset(&resDesc, 0, sizeof(resDesc));
 		resDesc.resType = cudaResourceTypePitch2D;
@@ -153,6 +159,7 @@ int main(int argc, char* argv[]) {
 
 		cudaTextureObject_t texture;
 		CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
+#endif
 
 		default_rng_t rng{1337};
 

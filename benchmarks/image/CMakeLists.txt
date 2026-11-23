@@ -1,4 +1,5 @@
 # Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
@@ -21,4 +22,9 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 add_executable(bench_image_ours bench_ours.cu ../../dependencies/stbi/stbi_wrapper.cpp)
-target_link_libraries(bench_image_ours PUBLIC ${CUDA_LIBRARIES} tiny-cuda-nn cublas)
+if (TCNN_USE_HIP)
+	set_source_files_properties(bench_ours.cu PROPERTIES LANGUAGE HIP)
+	target_link_libraries(bench_image_ours PUBLIC tiny-cuda-nn)
+else()
+	target_link_libraries(bench_image_ours PUBLIC ${CUDA_LIBRARIES} tiny-cuda-nn cublas)
+endif()

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -159,6 +160,12 @@ inline std::string cuda_runtime_version_string() {
 }
 
 int cuda_device();
+#if defined(TCNN_USE_HIP)
+// Creates this thread's hipBLAS handle for the current device, and the hipBLASLt handles of streams that
+// first needed one during a graph capture, if needed. Must happen outside of graph capture, because handle
+// creation synchronizes with the legacy stream.
+void hipblas_initialize();
+#endif
 void set_cuda_device(int device);
 int cuda_device_count();
 
@@ -401,7 +408,7 @@ private:
 	T m_val;
 };
 
-#if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
+#if defined(TCNN_GPU_COMPILER) || (defined(__clang__) && defined(__CUDA__))
 template <typename K, typename T, typename ... Types>
 inline void linear_kernel(K kernel, uint32_t shmem_size, cudaStream_t stream, T n_elements, Types ... args) {
 	if (n_elements <= 0) {

@@ -1,3 +1,4 @@
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 import os
 
 import re
@@ -12,6 +13,9 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 ROOT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+
+# A ROCm build of PyTorch targets AMD GPUs through HIP.
+IS_ROCM = torch.version.hip is not None
 
 def min_supported_compute_capability(cuda_version):
 	if cuda_version >= parse_version("13.0"):
@@ -44,7 +48,12 @@ print(f"Building PyTorch extension for tiny-cuda-nn version {VERSION}")
 
 ext_modules = []
 
-if "TCNN_CUDA_ARCHITECTURES" in os.environ and os.environ["TCNN_CUDA_ARCHITECTURES"]:
+if IS_ROCM:
+	# AMD GPUs provide the feature level tiny-cuda-nn associates with compute capability 8.0
+	# (see the HIP section of CMakeLists.txt). The GPU architectures are chosen in make_rocm_extension().
+	compute_capabilities = [80]
+	print(f"Building for AMD GPUs with ROCm/HIP {torch.version.hip}")
+elif "TCNN_CUDA_ARCHITECTURES" in os.environ and os.environ["TCNN_CUDA_ARCHITECTURES"]:
 	compute_capabilities = [int(x) for x in os.environ["TCNN_CUDA_ARCHITECTURES"].replace(";", ",").split(",")]
 	print(f"Obtained compute capabilities {compute_capabilities} from environment variable TCNN_CUDA_ARCHITECTURES")
 elif torch.cuda.is_available():
@@ -234,7 +243,52 @@ def make_extension(compute_capability):
 	)
 	return ext
 
-ext_modules = [make_extension(comp) for comp in compute_capabilities]
+def make_rocm_extension():
+	# Runtime compilation (JIT fusion) is not available on ROCm: the precompiled kernels are used.
+	definitions = [d for d in base_definitions if d != "-DTCNN_RTC"] + ["-DTCNN_USE_HIP", "-DTCNN_MIN_GPU_ARCH=80"]
+
+	if include_networks:
+		source_files = base_source_files + ["../../src/fully_fused_mlp.cu"]
+	else:
+		source_files = base_source_files
+
+	# AMD GPU architectures to build for. Defaults to AMD Instinct MI300 (gfx942) and MI350 (gfx950) series.
+	rocm_archs = [a for a in os.environ.get("PYTORCH_ROCM_ARCH", "gfx942;gfx950").replace(",", ";").split(";") if a]
+	print(f"Targeting AMD GPU architectures {rocm_archs}")
+
+	hip_flags = [
+		f"-std=c++{cpp_standard}",
+		# PyTorch disables the fp16 operators and conversions that tiny-cuda-nn relies on.
+		"-U__HIP_NO_HALF_OPERATORS__",
+		"-U__HIP_NO_HALF_CONVERSIONS__",
+		"-U__HIP_NO_HALF2_OPERATORS__",
+		"-U__CUDA_NO_HALF_OPERATORS__",
+		"-U__CUDA_NO_HALF_CONVERSIONS__",
+		"-U__CUDA_NO_HALF2_OPERATORS__",
+		# Closest equivalent of nvcc's --use_fast_math (not -ffast-math, which breaks isfinite() checks).
+		"-fgpu-flush-denormals-to-zero",
+		"-fgpu-approx-transcendentals",
+		"-munsafe-fp-atomics",
+		"-Wno-pass-failed",
+		"-fno-strict-aliasing",
+	] + [f"--offload-arch={arch}" for arch in rocm_archs]
+
+	return CUDAExtension(
+		name="tinycudann_bindings._rocm_C",
+		sources=source_files,
+		include_dirs=[
+			f"{root_dir}/include",
+			f"{root_dir}/dependencies",
+			f"{root_dir}/dependencies/fmt/include",
+		],
+		extra_compile_args={"cxx": base_cflags + definitions, "nvcc": hip_flags + definitions},
+		libraries=["hipblas", "hipblaslt"],
+	)
+
+if IS_ROCM:
+	ext_modules = [make_rocm_extension()]
+else:
+	ext_modules = [make_extension(comp) for comp in compute_capabilities]
 
 def package_files(directory):
 	paths = []

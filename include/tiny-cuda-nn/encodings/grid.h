@@ -319,6 +319,231 @@ __global__ void kernel_grid_backward(
 	}
 }
 
+#if defined(TCNN_USE_HIP)
+// Parameter-gradient scatter on AMD GPUs.
+//
+// The coarse levels of a multiresolution grid have few parameters (e.g. 16x16 vertices), so all samples
+// of a batch scatter into the same few hundred gradient entries. Device-scope atomics that collide on an
+// address are serialized on AMD Instinct GPUs, which makes these levels dominate the backward pass.
+// Levels whose parameters fit in shared memory are therefore accumulated per workgroup in fp32 shared
+// memory and added to the global gradient once per entry (kernel_grid_backward_shared); the other levels
+// use direct atomics like kernel_grid_backward (kernel_grid_backward_hip). Besides cutting the global
+// atomics of a small level from 2^N_POS_DIMS per sample to at most one per entry and workgroup, the fp32
+// partial sums are more accurate than accumulating every contribution directly at GRAD_T precision.
+
+// Calls `add(vertex_index, weight)` for every grid vertex that sample `i` interpolates at `level`, with
+// the vertex selection and weights of kernel_grid_backward.
+template <uint32_t N_POS_DIMS, HashType HASH_TYPE, typename ADD>
+__device__ void grid_backward_vertices(
+	const uint32_t i,
+	const uint32_t level,
+	const uint32_t num_elements,
+	const uint32_t hashmap_size,
+	const uint32_t resolution,
+	const float scale,
+	const bool stochastic_interpolation,
+	const InterpolationType interpolation_type,
+	const GridType grid_type,
+	MatrixView<const float> positions_in,
+	ADD&& add
+) {
+	float pos[N_POS_DIMS];
+	uvec<N_POS_DIMS> pos_grid;
+
+	if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, identity_fun);
+		}
+	} else {
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, smoothstep);
+		}
+	}
+
+	auto vertex_index = [&](const uvec<N_POS_DIMS>& local_pos) {
+		return grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos);
+	};
+
+	if (interpolation_type == InterpolationType::Nearest) {
+		add(vertex_index(pos_grid), 1.0f);
+		return;
+	}
+
+	if (stochastic_interpolation) {
+		float sample = random_val(1337, i + level * num_elements);
+		uvec<N_POS_DIMS> pos_grid_local;
+
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			if (sample >= pos[dim]) {
+				pos_grid_local[dim] = pos_grid[dim];
+			} else {
+				pos_grid_local[dim] = pos_grid[dim] + 1;
+			}
+		}
+
+		add(vertex_index(pos_grid_local), 1.0f);
+		return;
+	}
+
+	// N-linear interpolation
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t idx = 0; idx < (1 << N_POS_DIMS); ++idx) {
+		float weight = 1;
+		uvec<N_POS_DIMS> pos_grid_local;
+
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			if ((idx & (1<<dim)) == 0) {
+				weight *= 1 - pos[dim];
+				pos_grid_local[dim] = pos_grid[dim];
+			} else {
+				weight *= pos[dim];
+				pos_grid_local[dim] = pos_grid[dim] + 1;
+			}
+		}
+
+		add(vertex_index(pos_grid_local), weight);
+	}
+}
+
+// kernel_grid_backward for the levels first_level .. first_level + gridDim.y - 1.
+template <typename T, typename GRAD_T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, uint32_t N_FEATURES_PER_THREAD, HashType HASH_TYPE>
+__global__ void kernel_grid_backward_hip(
+	const uint32_t num_elements,
+	const uint32_t num_grid_features,
+	const uint32_t first_level,
+	const ParamsOffsetTable offset_table,
+	const uint32_t base_resolution,
+	const float log2_per_level_scale,
+	float max_level,
+	const float* __restrict__ max_level_gpu,
+	const bool stochastic_interpolation,
+	const InterpolationType interpolation_type,
+	const GridType grid_type,
+	GRAD_T* __restrict__ grid_gradient,
+	MatrixView<const float> positions_in,
+	const T* __restrict__ dL_dy
+) {
+	const uint32_t i = ((blockIdx.x * blockDim.x + threadIdx.x) * N_FEATURES_PER_THREAD) / N_FEATURES_PER_LEVEL;
+	if (i >= num_elements) return;
+
+	const uint32_t level = first_level + blockIdx.y; // <- the level is the same for all threads.
+	const uint32_t feature = (blockIdx.x * blockDim.x + threadIdx.x) * N_FEATURES_PER_THREAD - i * N_FEATURES_PER_LEVEL;
+
+	if (max_level_gpu) {
+		max_level = (max_level_gpu[i] * num_grid_features) / N_FEATURES_PER_LEVEL;
+	} else {
+		max_level = (max_level * num_grid_features) / N_FEATURES_PER_LEVEL;
+	}
+
+	if (level >= max_level + 1e-3f) {
+		return;
+	}
+
+	grid_gradient += offset_table.data[level] * N_FEATURES_PER_LEVEL;
+	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+
+	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
+	const uint32_t resolution = grid_resolution(scale);
+
+	tvec<GRAD_T, N_FEATURES_PER_THREAD> grad;
+
+	TCNN_PRAGMA_UNROLL
+	for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; ++f) {
+		grad[f] = (GRAD_T)dL_dy[i + (level * N_FEATURES_PER_LEVEL + feature + f) * num_elements];
+	}
+
+	grid_backward_vertices<N_POS_DIMS, HASH_TYPE>(
+		i, level, num_elements, hashmap_size, resolution, scale, stochastic_interpolation, interpolation_type, grid_type, positions_in,
+		[&](const uint32_t index, const float weight) {
+			atomic_add_gmem(grid_gradient + index * N_FEATURES_PER_LEVEL + feature, (GRAD_T)weight * grad);
+		}
+	);
+}
+
+// Levels 0 .. gridDim.y - 1, whose parameters fit in shared memory: each workgroup accumulates the
+// contributions of `num_elements_per_block` samples to one level in fp32 shared memory (dynamic size:
+// the parameter count of the largest of these levels), then adds them to the global gradient.
+template <typename T, typename GRAD_T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
+__global__ void kernel_grid_backward_shared(
+	const uint32_t num_elements,
+	const uint32_t num_elements_per_block,
+	const uint32_t num_grid_features,
+	const ParamsOffsetTable offset_table,
+	const uint32_t base_resolution,
+	const float log2_per_level_scale,
+	const float max_level,
+	const float* __restrict__ max_level_gpu,
+	const bool stochastic_interpolation,
+	const InterpolationType interpolation_type,
+	const GridType grid_type,
+	GRAD_T* __restrict__ grid_gradient,
+	MatrixView<const float> positions_in,
+	const T* __restrict__ dL_dy
+) {
+	extern __shared__ float shared_gradient[];
+
+	const uint32_t level = blockIdx.y;
+	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+
+	for (uint32_t j = threadIdx.x; j < hashmap_size * N_FEATURES_PER_LEVEL; j += blockDim.x) {
+		shared_gradient[j] = 0.0f;
+	}
+
+	__syncthreads();
+
+	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
+	const uint32_t resolution = grid_resolution(scale);
+
+	const uint32_t end = min(num_elements, (blockIdx.x + 1) * num_elements_per_block);
+	for (uint32_t i = blockIdx.x * num_elements_per_block + threadIdx.x; i < end; i += blockDim.x) {
+		const float level_limit = ((max_level_gpu ? max_level_gpu[i] : max_level) * num_grid_features) / N_FEATURES_PER_LEVEL;
+		if (level >= level_limit + 1e-3f) {
+			continue;
+		}
+
+		float grad[N_FEATURES_PER_LEVEL];
+
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+			grad[f] = (float)dL_dy[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements];
+		}
+
+		grid_backward_vertices<N_POS_DIMS, HASH_TYPE>(
+			i, level, num_elements, hashmap_size, resolution, scale, stochastic_interpolation, interpolation_type, grid_type, positions_in,
+			[&](const uint32_t index, const float weight) {
+				TCNN_PRAGMA_UNROLL
+				for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+					atomicAdd(&shared_gradient[index * N_FEATURES_PER_LEVEL + f], weight * grad[f]);
+				}
+			}
+		);
+	}
+
+	__syncthreads();
+
+	grid_gradient += offset_table.data[level] * N_FEATURES_PER_LEVEL;
+	for (uint32_t j = threadIdx.x; j < hashmap_size; j += blockDim.x) {
+		tvec<GRAD_T, N_FEATURES_PER_LEVEL> value;
+		bool nonzero = false;
+
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+			const float v = shared_gradient[j * N_FEATURES_PER_LEVEL + f];
+			value[f] = (GRAD_T)v;
+			nonzero |= v != 0.0f;
+		}
+
+		if (nonzero) {
+			atomic_add_gmem(grid_gradient + j * N_FEATURES_PER_LEVEL, value);
+		}
+	}
+}
+#endif
+
 template <typename T, uint32_t N_POS_DIMS>
 __global__ void kernel_grid_backward_input(
 	const uint32_t num_elements,
@@ -869,6 +1094,75 @@ public:
 			static constexpr uint32_t N_THREADS_HASHGRID = 256;
 			static constexpr uint32_t N_FEATURES_PER_THREAD = std::min(2u, N_FEATURES_PER_LEVEL);
 
+#if defined(TCNN_USE_HIP)
+			// The first levels, as long as they have at most N_ELEMENTS_PER_BLOCK_SHARED parameters (vertices)
+			// and their fp32 gradient fits in MAX_SHARED_BYTES, go through kernel_grid_backward_shared: per
+			// workgroup of N_ELEMENTS_PER_BLOCK_SHARED samples, at most one global atomic per vertex instead of
+			// 2^N_POS_DIMS per sample. The remaining levels go through kernel_grid_backward_hip.
+			static constexpr uint32_t N_ELEMENTS_PER_BLOCK_SHARED = 4096;
+			static constexpr uint32_t MAX_SHARED_BYTES = 32 * 1024;
+
+			uint32_t n_shared_levels = 0;
+			uint32_t max_shared_level_params = 0;
+			while (n_shared_levels < m_n_levels) {
+				const uint32_t level_params = m_offset_table.data[n_shared_levels + 1] - m_offset_table.data[n_shared_levels];
+				if (level_params > N_ELEMENTS_PER_BLOCK_SHARED || level_params * N_FEATURES_PER_LEVEL * sizeof(float) > MAX_SHARED_BYTES) {
+					break;
+				}
+				max_shared_level_params = std::max(max_shared_level_params, level_params);
+				++n_shared_levels;
+			}
+
+			const MatrixView<const float> positions = forward.positions.data() ? forward.positions.view() : input.view(); // positions SoA
+			const float log2_per_level_scale = std::log2(m_per_level_scale);
+
+			{
+				// The two kernels touch disjoint levels and are limited by different units (shared-memory vs.
+				// global atomics), so they run concurrently.
+				SyncedMultiStream synced_streams{stream, n_shared_levels > 0 && n_shared_levels < m_n_levels ? 2u : 1u};
+
+				if (n_shared_levels > 0) {
+					const dim3 blocks_shared = { div_round_up(num_elements, N_ELEMENTS_PER_BLOCK_SHARED), n_shared_levels, 1 };
+					const size_t shared_bytes = max_shared_level_params * N_FEATURES_PER_LEVEL * sizeof(float);
+					kernel_grid_backward_shared<T, grad_t, N_POS_DIMS, N_FEATURES_PER_LEVEL, HASH_TYPE><<<blocks_shared, N_THREADS_HASHGRID, shared_bytes, synced_streams.get(n_shared_levels < m_n_levels ? 1 : 0)>>>(
+						num_elements,
+						N_ELEMENTS_PER_BLOCK_SHARED,
+						m_n_features,
+						m_offset_table,
+						m_base_resolution,
+						log2_per_level_scale,
+						this->m_max_level,
+						this->m_max_level_gpu,
+						m_stochastic_interpolation,
+						m_interpolation_type,
+						m_grid_type,
+						grid_gradient,
+						positions,
+						dL_dy_rm // gradients SoA
+					);
+				}
+
+				if (n_shared_levels < m_n_levels) {
+					const dim3 blocks_hashgrid = { div_round_up(num_elements * N_FEATURES_PER_LEVEL / N_FEATURES_PER_THREAD, N_THREADS_HASHGRID), m_n_levels - n_shared_levels, 1 };
+					kernel_grid_backward_hip<T, grad_t, N_POS_DIMS, N_FEATURES_PER_LEVEL, N_FEATURES_PER_THREAD, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, synced_streams.get(0)>>>(
+						num_elements,
+						m_n_features,
+						n_shared_levels,
+						m_offset_table,
+						m_base_resolution,
+						log2_per_level_scale,
+						this->m_max_level,
+						this->m_max_level_gpu,
+						m_stochastic_interpolation,
+						m_interpolation_type,
+						m_grid_type,
+						grid_gradient,
+						positions,
+						dL_dy_rm // gradients SoA
+					);
+				}
+			}
+#else
 			const dim3 blocks_hashgrid = { div_round_up(num_elements * N_FEATURES_PER_LEVEL / N_FEATURES_PER_THREAD, N_THREADS_HASHGRID), m_n_levels, 1 };
 
 			kernel_grid_backward<T, grad_t, N_POS_DIMS, N_FEATURES_PER_LEVEL, N_FEATURES_PER_THREAD, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, stream>>>(
@@ -886,6 +1180,7 @@ public:
 				forward.positions.data() ? forward.positions.view() : input.view(), // positions SoA
 				dL_dy_rm // gradients SoA
 			);
+#endif
 
 			if (!std::is_same<grad_t, T>::value) {
 				parallel_for_gpu(stream, n_params(), [grad=this->gradients(), grad_tmp=grid_gradient] __device__ (size_t i) {
