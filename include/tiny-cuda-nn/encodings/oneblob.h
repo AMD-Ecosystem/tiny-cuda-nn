@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -58,7 +59,7 @@ __device__ inline float one_blob_subwarp_aligned(F kernel, MatrixView<const floa
 	// Note that this procedure necessitates making the OneBlob encoding wrap around (hence also the 3 kernel calls above),
 	// which may not always be desired.
 	// If not desired, use the slower implementation without wraparound below.
-	float right_cdf = __shfl_sync(0xffffffff, left_cdf, bin_index + 1, n_bins);
+	float right_cdf = __shfl_sync(TCNN_FULL_WARP_MASK, left_cdf, bin_index + 1, n_bins);
 	if (bin_index == n_bins - 1) {
 		right_cdf += 1; // The right CDF must gain a 1 due to wrapping from right to left (it lost one (hopefully) saturated CDF)
 	}
@@ -192,7 +193,13 @@ public:
 		const uint32_t num_bins_log2 = (uint32_t)std::log2(m_n_bins);
 
 		if (output->layout() == AoS) {
+#if defined(TCNN_USE_HIP)
+			// N_THREADS_LINEAR threads hold a single sample of a 128-wide encoding. Launching that many
+			// small workgroups is rate-limited on AMD GPUs, so use workgroups of several samples.
+			const uint32_t min_n_threads = 512;
+#else
 			const uint32_t min_n_threads = N_THREADS_LINEAR;
+#endif
 			const dim3 threads = { m_n_output_dims, div_round_up(min_n_threads, m_n_output_dims), 1 };
 			const uint32_t n_threads = threads.x * threads.y;
 			const dim3 blocks = { div_round_up(input.n() * m_n_output_dims, n_threads), 1, 1 };

@@ -1,4 +1,5 @@
 # Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
@@ -25,5 +26,8 @@
 ###############################################################################
 
 add_executable(mlp_learning_an_image mlp_learning_an_image.cu ../dependencies/stbi/stbi_wrapper.cpp)
+if (TCNN_USE_HIP)
+	set_source_files_properties(mlp_learning_an_image.cu PROPERTIES LANGUAGE HIP)
+endif()
 target_link_libraries(mlp_learning_an_image PUBLIC ${CUDA_LIBRARIES} tiny-cuda-nn)
 

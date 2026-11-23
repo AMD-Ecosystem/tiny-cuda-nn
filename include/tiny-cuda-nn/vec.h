@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -199,7 +200,7 @@ template <typename T> TCNN_HOST_DEVICE T exp2(T a) { return std::exp2(a); }
 template <typename T> TCNN_HOST_DEVICE T log2(T a) { return std::log2(a); }
 template <typename T> TCNN_HOST_DEVICE T pow(T a, T b) { return std::pow(a, b); }
 template <typename T> TCNN_HOST_DEVICE T isfinite(T a) {
-#if defined(__CUDA_ARCH__)
+#if defined(TCNN_DEVICE_CODE)
 	return ::isfinite(a);
 #else
 	return std::isfinite(a);
@@ -207,9 +208,9 @@ template <typename T> TCNN_HOST_DEVICE T isfinite(T a) {
 }
 
 inline TCNN_HOST_DEVICE float fma(float a, float b, float c) { return fmaf(a, b, c); }
-#ifdef __CUDACC__
+#if defined(TCNN_GPU_COMPILER)
 inline TCNN_DEVICE __half fma(__half a, __half b, __half c) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(TCNN_DEVICE_ARCH) && TCNN_DEVICE_ARCH >= 600
 	return __hfma(a, b, c);
 #else
 	return fmaf(a, b, c);
@@ -298,11 +299,15 @@ CWISE_OP(pow, TVEC, pow(a[i], b[i]), const TVEC& a, const TVEC& b)
 
 CWISE_OP(isfinite, BVEC, isfinite(a[i]), const TVEC& a)
 
-#if defined(__CUDACC__)
+#if defined(TCNN_GPU_COMPILER)
 inline TCNN_DEVICE void atomic_add_gmem_float(float* addr, float in) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 	int in_int = *((int*)&in);
 	asm ("red.relaxed.gpu.global.add.f32 [%0], %1;" :: "l"(addr), "r"(in_int));
+#elif defined(TCNN_USE_HIP)
+	// Hardware fp32 atomic add (the counterpart of the PTX red above), independent of whether the
+	// translation unit is compiled with -munsafe-fp-atomics.
+	unsafeAtomicAdd(addr, in);
 #else
 	atomicAdd(addr, in);
 #endif
@@ -324,11 +329,24 @@ TCNN_DEVICE void atomic_add_gmem(float* dst, const tvec<float, N, A>& a) {
 	}
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 // atomicAdd(__half2) is only supported with compute capability 60 and above
+#if defined(TCNN_DEVICE_ARCH) && TCNN_DEVICE_ARCH >= 600 // atomicAdd(__half2) is only supported with compute capability 60 and above
 inline TCNN_DEVICE void atomic_add_gmem_h2(half2* addr, half2 in) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 	int in_int = *((int*)&in);
 	asm ("red.relaxed.gpu.global.add.noftz.f16x2 [%0], %1;" :: "l"(addr), "r"(in_int));
+#elif defined(TCNN_USE_HIP)
+	// Hardware packed-fp16 atomic add. HIP's atomicAdd(__half2*) is a compare-and-swap loop.
+	// unsafeAtomicAdd(__half2*) silently does nothing on a target without the packed-add
+	// instruction, so fall back to atomicAdd there.
+#if __has_builtin(__builtin_amdgcn_flat_atomic_fadd_v2f16) && __has_builtin(__builtin_amdgcn_is_invocable)
+	if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_flat_atomic_fadd_v2f16)) {
+		unsafeAtomicAdd(addr, in);
+	} else {
+		atomicAdd(addr, in);
+	}
+#else
+	atomicAdd(addr, in);
+#endif
 #else
 	atomicAdd(addr, in);
 #endif
@@ -355,7 +373,7 @@ TCNN_DEVICE void atomic_add_gmem(__half* dst, const tvec<__half, N, A>& a) {
 #undef CWISE_OP
 
 // __half2 specializations for aligned vectors with 2*N fp16 coefficients.
-#if defined(__CUDACC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+#if defined(TCNN_GPU_COMPILER) && defined(TCNN_DEVICE_ARCH) && TCNN_DEVICE_ARCH >= 600
 
 #define HVEC tvec<__half, N, A>
 #define HALF_CWISE_OP(operation, type_result, expr, ...) \
@@ -511,11 +529,11 @@ DEF_NON_TEMPLATED_VECTOR_TYPES(i16vec, int16_t)
 DEF_NON_TEMPLATED_VECTOR_TYPES(u16vec, uint16_t)
 DEF_NON_TEMPLATED_VECTOR_TYPES(i8vec, int8_t)
 DEF_NON_TEMPLATED_VECTOR_TYPES(u8vec, uint8_t)
-#if defined(__CUDACC__)
+#if defined(TCNN_GPU_COMPILER)
 DEF_NON_TEMPLATED_VECTOR_TYPES(hvec, __half)
 #endif
 
-#if defined(__CUDACC__)
+#if defined(TCNN_GPU_COMPILER)
 inline TCNN_HOST_DEVICE float4 to_float4(const vec4& x) { return {x.x, x.y, x.z, x.w}; }
 inline TCNN_HOST_DEVICE float3 to_float3(const vec3& x) { return {x.x, x.y, x.z}; }
 inline TCNN_HOST_DEVICE float2 to_float2(const vec2& x) { return {x.x, x.y}; }
@@ -1068,7 +1086,7 @@ using name##2 = name##2x2;
 
 DEF_NON_TEMPLATED_MATRIX_TYPES(mat, float)
 DEF_NON_TEMPLATED_MATRIX_TYPES(dmat, double)
-#if defined(__CUDACC__)
+#if defined(TCNN_GPU_COMPILER)
 DEF_NON_TEMPLATED_MATRIX_TYPES(hmat, __half)
 #endif
 

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -32,6 +33,12 @@
 #pragma once
 
 #include <tiny-cuda-nn/common.h>
+
+#if defined(TCNN_USE_HIP)
+// On AMD GPUs, CUTLASS is unavailable; the same fc_multiply / fc_multiply_split_k interface is
+// implemented on top of hipBLAS.
+#include <tiny-cuda-nn/hip_matmul.h>
+#else
 
 #include <tiny-cuda-nn/gpu_matrix.h>
 #include <tiny-cuda-nn/common_device.h>
@@ -602,3 +609,5 @@ void fc_multiply_split_k(
 }
 
 }
+
+#endif // TCNN_USE_HIP

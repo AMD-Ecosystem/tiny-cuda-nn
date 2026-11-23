@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -37,9 +38,13 @@
 namespace tcnn {
 
 __forceinline__ __device__ unsigned lane_id() {
+#if defined(TCNN_USE_HIP)
+	return __lane_id(); // wavefront-size agnostic (wave64 on CDNA, wave32 on RDNA/gfx12)
+#else
 	unsigned ret;
 	asm volatile("mov.u32 %0, %laneid;" : "=r"(ret));
 	return ret;
+#endif
 }
 
 static constexpr float SQRT2 = 1.41421356237309504880f;
@@ -98,7 +103,7 @@ __host__ __device__ T relu(T val) {
 
 template <>
 inline __host__ __device__ half relu(half val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(TCNN_DEVICE_CODE) && TCNN_DEVICE_ARCH >= 800
 	return __hmax(val, (half)0.0f);
 #else
 	return (half)relu<float>((float)val);

@@ -1,4 +1,5 @@
 # Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -48,7 +49,14 @@ ALL_COMPUTE_CAPABILITIES.append(system_compute_capability)
 # we can find and is compatible with the system's compute capability.
 _C = None
 
-for cc in reversed(ALL_COMPUTE_CAPABILITIES):
+if torch.version.hip is not None:
+	# ROCm builds ship a single extension module covering all targeted AMD GPU architectures.
+	try:
+		_C = importlib.import_module("tinycudann_bindings._rocm_C")
+	except ModuleNotFoundError:
+		raise EnvironmentError("Could not find the tinycudann extension for ROCm (tinycudann_bindings._rocm_C). Build and install bindings/torch with a ROCm build of PyTorch.")
+
+for cc in ([] if _C is not None else reversed(ALL_COMPUTE_CAPABILITIES)):
 	if cc > system_compute_capability:
 		# incompatible
 		continue

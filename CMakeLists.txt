@@ -1,4 +1,5 @@
 # Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # 
 # Redistribution and use in source and binary forms, with or without modification, are permitted
 # provided that the following conditions are met:
@@ -22,11 +23,29 @@
 
 cmake_minimum_required(VERSION 3.18)
 
+option(TCNN_USE_HIP "Build tiny-cuda-nn for AMD GPUs with HIP/ROCm instead of CUDA?" OFF)
+
+if (TCNN_USE_HIP)
+	cmake_minimum_required(VERSION 3.21) # HIP language support
+	if (NOT DEFINED CMAKE_HIP_ARCHITECTURES AND NOT DEFINED ENV{HIPARCHS})
+		if (GPU_TARGETS)
+			# Honor the ROCm-wide GPU_TARGETS variable (also set by TheRock and other ROCm super-builds).
+			set(CMAKE_HIP_ARCHITECTURES "${GPU_TARGETS}" CACHE STRING "AMD GPU architectures to build for")
+		else()
+			# AMD Instinct MI300 series (gfx942) and MI350 series (gfx950)
+			set(CMAKE_HIP_ARCHITECTURES "gfx942;gfx950" CACHE STRING "AMD GPU architectures to build for")
+		endif()
+	endif()
+	set(TCNN_LANGUAGES CXX HIP)
+else()
+	set(TCNN_LANGUAGES CXX CUDA)
+endif()
+
 project(
 	tiny-cuda-nn
 	VERSION 2.0
 	DESCRIPTION "Lightning fast & tiny C++/CUDA neural network framework"
-	LANGUAGES CXX CUDA
+	LANGUAGES ${TCNN_LANGUAGES}
 )
 
 option(TCNN_ALLOW_CUBLAS_CUSOLVER "Allows tiny-cuda-nn to use cuBLAS and cuSolver. Only required for the Shampoo optimizer." OFF)
@@ -41,6 +60,7 @@ set(TCNN_EXTERNAL_FMT "" CACHE STRING "If non-empty, the `fmt` target is supplie
 
 set(TCNN_CUDA_ARCHITECTURES "" CACHE STRING "Build tiny-cuda-nn for a specific GPU architecture.")
 option(TCNN_LINK_CUDA "Link tiny-cuda-nn to CUDA libraries?" ON)
+option(TCNN_INSTALL "Generate install rules and a CMake package config for the tiny-cuda-nn library?" OFF)
 
 ###############################################################################
 # Build type and C++ compiler setup
@@ -79,6 +99,72 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+###############################################################################
+# HIP compiler setup (AMD GPUs)
+###############################################################################
+
+if (TCNN_USE_HIP)
+	get_directory_property(TCNN_HAS_PARENT PARENT_DIRECTORY)
+
+	set(CMAKE_HIP_STANDARD 17)
+	set(CMAKE_HIP_STANDARD_REQUIRED ON)
+	set(CMAKE_HIP_EXTENSIONS OFF)
+
+	if (TCNN_BUILD_WITH_RTC)
+		message(STATUS "Runtime compilation (JIT fusion) of fully fused kernels is not supported on HIP. Disabling TCNN_BUILD_WITH_RTC.")
+		set(TCNN_BUILD_WITH_RTC OFF CACHE BOOL "Build support for runtime compilation of fully fused kernels?" FORCE)
+	endif()
+	if (TCNN_ALLOW_CUBLAS_CUSOLVER)
+		message(WARNING "TCNN_ALLOW_CUBLAS_CUSOLVER (Shampoo optimizer) is not supported on HIP and is ignored.")
+	endif()
+
+	find_package(hip REQUIRED)
+	find_package(hipblas REQUIRED)
+	find_package(hipblaslt REQUIRED)
+	# rocWMMA is header-only. Use the include directory exported by its package config rather than
+	# the roc::rocwmma target, whose link interface also pulls in hip::device and OpenMP.
+	find_package(rocwmma CONFIG REQUIRED)
+	set(TCNN_ROCWMMA_INCLUDE_DIR "${rocwmma_INCLUDE_DIR}")
+
+	# AMD Instinct GPUs provide every feature that tiny-cuda-nn gates on NVIDIA compute capability
+	# (fp16 arithmetic and atomics, matrix cores for the fully fused MLP), so the HIP build uses the
+	# feature level of compute capability 8.0.
+	set(MIN_GPU_ARCH 80)
+
+	option(TCNN_HALF_PRECISION "Enable half precision (FP16) arithmetic" ON)
+	if (TCNN_HALF_PRECISION)
+		list(APPEND TCNN_DEFINITIONS -DTCNN_HALF_PRECISION=1)
+	else()
+		list(APPEND TCNN_DEFINITIONS -DTCNN_HALF_PRECISION=0)
+	endif()
+	message(STATUS "TCNN_HALF_PRECISION: ${TCNN_HALF_PRECISION}")
+	message(STATUS "Targeting HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+
+	list(APPEND TCNN_DEFINITIONS -DTCNN_USE_HIP)
+	list(APPEND TCNN_INCLUDES "include" "${TCNN_ROCWMMA_INCLUDE_DIR}")
+	list(APPEND TCNN_LIBRARIES hip::host roc::hipblas roc::hipblaslt)
+
+	if (TCNN_BUILD_USE_FAST_MATH)
+		# Closest equivalent of nvcc's --use_fast_math. Deliberately not -ffast-math, whose
+		# finite-math-only assumption would break tiny-cuda-nn's isfinite() guards.
+		list(APPEND TCNN_HIP_FLAGS -fgpu-flush-denormals-to-zero -fgpu-approx-transcendentals)
+	endif()
+	# Use hardware floating-point atomics (relaxed IEEE semantics), as nvcc does by default. This is
+	# applied to tiny-cuda-nn's own sources only (PRIVATE below): it changes the semantics of
+	# atomicAdd(float*) on fine-grained memory, so it must not leak into consumers' code. The
+	# gradient-accumulation helpers in vec.h call unsafeAtomicAdd explicitly, so header code that
+	# consumers instantiate gets the hardware atomics without the flag.
+	set(TCNN_HIP_PRIVATE_FLAGS -munsafe-fp-atomics)
+	# `#pragma unroll` on loops with runtime trip counts is a hint that clang reports when it cannot honor it.
+	list(APPEND TCNN_HIP_FLAGS -Wno-pass-failed)
+
+	if (TCNN_HAS_PARENT)
+		set(TCNN_HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES} PARENT_SCOPE)
+		set(TCNN_HALF_PRECISION ${TCNN_HALF_PRECISION} PARENT_SCOPE)
+		set(TCNN_DEFINITIONS ${TCNN_DEFINITIONS} PARENT_SCOPE)
+	endif()
+else()
 
 ###############################################################################
 # CUDA compiler setup
@@ -243,9 +329,11 @@ if (TCNN_HAS_PARENT)
 	set(TCNN_DEFINITIONS ${TCNN_DEFINITIONS} PARENT_SCOPE)
 endif()
 
+endif() # TCNN_USE_HIP
+
 # Only compile the shampoo optimizer if
 # a recent enough cuBLAS version is available.
-if (TCNN_ALLOW_CUBLAS_CUSOLVER AND CUDA_VERSION VERSION_GREATER_EQUAL 11.0)
+if (TCNN_ALLOW_CUBLAS_CUSOLVER AND NOT TCNN_USE_HIP AND CUDA_VERSION VERSION_GREATER_EQUAL 11.0)
 	set(TCNN_BUILD_WITH_SHAMPOO ON)
 else()
 	set(TCNN_BUILD_WITH_SHAMPOO OFF)
@@ -267,7 +355,7 @@ if (TCNN_BUILD_NO_FWD_BWD)
 	list(APPEND TCNN_DEFINITIONS -DTCNN_NO_FWD_BWD)
 endif()
 
-if (TCNN_LINK_CUDA)
+if (TCNN_LINK_CUDA AND NOT TCNN_USE_HIP)
 	list(APPEND TCNN_LIBRARIES cuda)
 	if (TCNN_BUILD_WITH_SHAMPOO)
 		list(APPEND TCNN_LIBRARIES cublas)
@@ -303,6 +391,10 @@ endif()
 set(BUILD_SHARED_LIBS OFF)
 
 if (TCNN_EXTERNAL_FMT)
+	if (TCNN_EXTERNAL_FMT MATCHES "::" AND NOT TARGET "${TCNN_EXTERNAL_FMT}")
+		# An imported fmt target (e.g. fmt::fmt) that the parent project has not created yet: use the installed fmt package.
+		find_package(fmt CONFIG REQUIRED)
+	endif()
 	list(APPEND TCNN_LIBRARIES "${TCNN_EXTERNAL_FMT}")
 	list(APPEND TCNN_DEFINITIONS -DFMT_UNICODE=0)
 else()
@@ -339,6 +431,10 @@ if (MIN_GPU_ARCH GREATER 70)
 endif()
 
 list(APPEND TCNN_DEFINITIONS -DTCNN_MIN_GPU_ARCH=${MIN_GPU_ARCH})
+
+if (TCNN_USE_HIP)
+	set_source_files_properties(${TCNN_SOURCES} PROPERTIES LANGUAGE HIP)
+endif()
 
 ###############################################################################
 # Linker / library
@@ -390,7 +486,24 @@ list(APPEND TCNN_INCLUDES
 add_library(tiny-cuda-nn STATIC ${TCNN_SOURCES})
 target_compile_definitions(tiny-cuda-nn PUBLIC ${TCNN_DEFINITIONS})
 target_compile_options(tiny-cuda-nn PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
-target_include_directories(tiny-cuda-nn PUBLIC ${TCNN_INCLUDES})
+if (TCNN_USE_HIP)
+	target_compile_options(tiny-cuda-nn PUBLIC $<$<COMPILE_LANGUAGE:HIP>:${TCNN_HIP_FLAGS}>)
+	target_compile_options(tiny-cuda-nn PRIVATE $<$<COMPILE_LANGUAGE:HIP>:${TCNN_HIP_PRIVATE_FLAGS}>)
+endif()
+if (TCNN_INSTALL)
+	include(GNUInstallDirs)
+	# Source-tree include directories are build-only; installed consumers use the installed headers.
+	foreach (TCNN_INCLUDE IN LISTS TCNN_INCLUDES)
+		get_filename_component(TCNN_INCLUDE "${TCNN_INCLUDE}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+		target_include_directories(tiny-cuda-nn PUBLIC $<BUILD_INTERFACE:${TCNN_INCLUDE}>)
+	endforeach()
+	target_include_directories(tiny-cuda-nn PUBLIC
+		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/tiny-cuda-nn/dependencies>
+	)
+else()
+	target_include_directories(tiny-cuda-nn PUBLIC ${TCNN_INCLUDES})
+endif()
 target_link_libraries(tiny-cuda-nn PUBLIC ${TCNN_LIBRARIES})
 
 if (TCNN_BUILD_EXAMPLES)
@@ -406,4 +519,54 @@ if (TCNN_BUILD_TESTS)
 	enable_testing()
 	add_subdirectory(tests)
 	list(APPEND CMAKE_CTEST_ARGUMENTS "--output-on-failure")
+endif()
+
+###############################################################################
+# Installation
+###############################################################################
+
+if (TCNN_INSTALL)
+	include(CMakePackageConfigHelpers)
+
+	install(TARGETS tiny-cuda-nn tiny-cuda-nn-resources cmrc-base
+		EXPORT tiny-cuda-nn-targets
+		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+	)
+	install(DIRECTORY include/tiny-cuda-nn DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+	# Header-only dependencies included by the public headers, kept out of the top-level include directory.
+	install(DIRECTORY dependencies/json dependencies/pcg32 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tiny-cuda-nn/dependencies)
+	if (NOT TCNN_EXTERNAL_FMT)
+		install(TARGETS fmt EXPORT tiny-cuda-nn-targets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+		install(DIRECTORY dependencies/fmt/include/fmt DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tiny-cuda-nn/dependencies)
+	endif()
+
+	set(TCNN_CONFIG_DEPENDENCIES "")
+	if (TCNN_USE_HIP)
+		string(APPEND TCNN_CONFIG_DEPENDENCIES "find_dependency(hip)\nfind_dependency(hipblas)\nfind_dependency(hipblaslt)\n")
+	endif()
+	if (TCNN_EXTERNAL_FMT MATCHES "^fmt::")
+		string(APPEND TCNN_CONFIG_DEPENDENCIES "find_dependency(fmt)\n")
+	endif()
+	set(TCNN_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/tiny-cuda-nn)
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config.cmake.in"
+		"@PACKAGE_INIT@\n"
+		"include(CMakeFindDependencyMacro)\n"
+		"${TCNN_CONFIG_DEPENDENCIES}"
+		"include(\"\${CMAKE_CURRENT_LIST_DIR}/tiny-cuda-nn-targets.cmake\")\n"
+		"check_required_components(tiny-cuda-nn)\n"
+	)
+	configure_package_config_file("${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config.cmake.in"
+		"${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config.cmake"
+		INSTALL_DESTINATION ${TCNN_CMAKE_DIR}
+	)
+	write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config-version.cmake"
+		COMPATIBILITY SameMajorVersion
+	)
+	install(EXPORT tiny-cuda-nn-targets NAMESPACE tiny-cuda-nn:: DESTINATION ${TCNN_CMAKE_DIR})
+	install(FILES
+		"${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config.cmake"
+		"${CMAKE_CURRENT_BINARY_DIR}/tiny-cuda-nn-config-version.cmake"
+		DESTINATION ${TCNN_CMAKE_DIR}
+	)
 endif()
